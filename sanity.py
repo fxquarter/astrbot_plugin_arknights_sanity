@@ -61,8 +61,10 @@ def extract_status(data: dict):
     if ap is None or max_ap is None:
         return None
 
-    ap_val = int(ap)
-    max_ap_val = int(max_ap)
+    ap_val = to_int(ap)
+    max_ap_val = to_int(max_ap)
+    if ap_val is None or max_ap_val is None:
+        return None
     current_ts = to_seconds_ts(payload.get("currentTs"))
     ap_estimated, ap_full_eta = estimate_realtime_ap(
         ap_info, ap_val, max_ap_val, current_ts

@@ -1,6 +1,6 @@
 import asyncio
 import json
-import os
+from pathlib import Path
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -10,16 +10,16 @@ from .api_process import SklandClient
 from .sanity import evaluate_reminder_state, extract_status
 
 
-def load_config(config_path: str) -> dict:
+def load_config(config_path: Path) -> dict:
     """读取 config.json 原始数据。
 
     这里不注入默认字段，确保配置来源始终只有 config.json。
     """
-    if not os.path.exists(config_path):
+    if not config_path.exists():
         return {}
 
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
+        with config_path.open("r", encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
     except Exception as e:
@@ -27,9 +27,10 @@ def load_config(config_path: str) -> dict:
         return {}
 
 
-def save_config(config_path: str, config: dict) -> None:
+def save_config(config_path: Path, config: dict) -> None:
     """持久化运行期配置（例如提醒会话订阅列表）。"""
-    with open(config_path, "w", encoding="utf-8") as f:
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    with config_path.open("w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=4)
 
 
@@ -43,10 +44,11 @@ def save_config(config_path: str, config: dict) -> None:
 class ArknightsHelper(Star):
     def __init__(self, context: Context):
         super().__init__(context)
-        self.config_path = os.path.join(os.path.dirname(__file__), "config.json")
+        self.config_path = Path(__file__).with_name("config.json")
         self.config = load_config(self.config_path)
         self.skland = SklandClient(self.config.get("token", ""))
         self.check_task = None
+        self._config_lock = asyncio.Lock()
         self.reminded = False
 
     async def initialize(self):
@@ -55,8 +57,9 @@ class ArknightsHelper(Star):
     def reload_config(self):
         self.config = load_config(self.config_path)
 
-    def persist_config(self):
-        save_config(self.config_path, self.config)
+    async def persist_config(self):
+        async with self._config_lock:
+            save_config(self.config_path, self.config)
 
     def _known_platform_ids(self) -> set[str]:
         ids: set[str] = set()
@@ -64,7 +67,7 @@ class ArknightsHelper(Star):
             ids.add(str(platform.meta().id))
         return ids
 
-    def _prune_invalid_notify_users(self) -> list[str]:
+    async def _prune_invalid_notify_users(self) -> list[str]:
         """清理平台适配器已不存在的会话。"""
         notify_users = [
             str(umo).strip()
@@ -87,7 +90,7 @@ class ArknightsHelper(Star):
         if removed:
             logger.warning("removed stale notify sessions: %s", ",".join(removed))
             self.config["notify_users"] = valid
-            self.persist_config()
+            await self.persist_config()
 
         return valid
 
@@ -95,7 +98,7 @@ class ArknightsHelper(Star):
         """主动推送满理智提醒，并返回 (成功数, 失败数)。"""
         from astrbot.api.event import MessageChain
 
-        notify_users = self._prune_invalid_notify_users()
+        notify_users = await self._prune_invalid_notify_users()
         if not notify_users:
             return 0, 0
 
@@ -116,6 +119,8 @@ class ArknightsHelper(Star):
                         "full sanity reminder send failed, umo=%s reason=platform-not-found",
                         umo,
                     )
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 failed += 1
                 logger.warning(
@@ -140,15 +145,15 @@ class ArknightsHelper(Star):
         notify_users = self.config.setdefault("notify_users", [])
 
         if "notify on" in msg:
-            self._prune_invalid_notify_users()
+            await self._prune_invalid_notify_users()
             if umo not in notify_users:
                 notify_users.append(umo)
-                self.persist_config()
+                await self.persist_config()
             yield event.plain_result("满理智提醒已开启！理智达到最大值时将提醒您。")
         elif "notify off" in msg:
             if umo in notify_users:
                 notify_users.remove(umo)
-                self.persist_config()
+                await self.persist_config()
             yield event.plain_result("满理智提醒已关闭！")
         else:
             yield event.plain_result(
@@ -252,6 +257,9 @@ class ArknightsHelper(Star):
                             data.get("code"),
                             data.get("message"),
                         )
+            except asyncio.CancelledError:
+                logger.info("check_sanity_loop cancelled")
+                raise
             except Exception as e:
                 logger.error(f"Error in check_sanity_loop: {e}")
 
@@ -260,3 +268,8 @@ class ArknightsHelper(Star):
     async def terminate(self):
         if self.check_task:
             self.check_task.cancel()
+            try:
+                await self.check_task
+            except asyncio.CancelledError:
+                pass
+        await self.skland.close()

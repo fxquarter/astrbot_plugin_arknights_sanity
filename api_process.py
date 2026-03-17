@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import hmac
 import json
@@ -22,6 +23,8 @@ class SklandClient:
         self.channel_name = ""
         self.dId = "de9759a5afaa634f"
         self.platform = "1"
+        self._session: aiohttp.ClientSession | None = None
+        self._session_lock = asyncio.Lock()
 
     @staticmethod
     def _normalize_token(token: str) -> str:
@@ -41,13 +44,13 @@ class SklandClient:
                     t = payload["data"]["content"].strip()
                 elif isinstance(payload.get("token"), str):
                     t = payload["token"].strip()
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError):
             pass
 
         if len(t) >= 2 and t[0] == '"' and t[-1] == '"':
             try:
                 t = json.loads(t)
-            except Exception:
+            except (json.JSONDecodeError, TypeError, ValueError):
                 t = t[1:-1]
 
         return t
@@ -88,35 +91,47 @@ class SklandClient:
             "dId": self.dId,
         }
 
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session and not self._session.closed:
+            return self._session
+
+        async with self._session_lock:
+            if self._session and not self._session.closed:
+                return self._session
+            self._session = aiohttp.ClientSession()
+            return self._session
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+
     async def _exchange_user_token_to_cred(self) -> bool:
         user_token = self._normalize_token(self.token)
         if not user_token:
             return False
 
         base_headers = self._base_headers()
-        async with aiohttp.ClientSession() as session:
-            grant_url = "https://as.hypergryph.com/user/oauth2/v2/grant"
-            grant_body = {"appCode": "4ca99fa6b56cc2ba", "token": user_token, "type": 0}
-            async with session.post(
-                grant_url, headers=base_headers, json=grant_body
-            ) as resp:
-                grant_data = await resp.json(content_type=None)
+        session = await self._get_session()
+        grant_url = "https://as.hypergryph.com/user/oauth2/v2/grant"
+        grant_body = {"appCode": "4ca99fa6b56cc2ba", "token": user_token, "type": 0}
+        async with session.post(
+            grant_url, headers=base_headers, json=grant_body
+        ) as resp:
+            grant_data = await resp.json(content_type=None)
 
-            if grant_data.get("status") != 0:
-                logger.warning(f"Skland grant failed: {grant_data}")
-                return False
+        if grant_data.get("status") != 0:
+            logger.warning(f"Skland grant failed: {grant_data}")
+            return False
 
-            auth_code = grant_data.get("data", {}).get("code")
-            if not auth_code:
-                logger.warning(f"Skland grant returned empty code: {grant_data}")
-                return False
+        auth_code = grant_data.get("data", {}).get("code")
+        if not auth_code:
+            logger.warning(f"Skland grant returned empty code: {grant_data}")
+            return False
 
-            cred_url = "https://zonai.skland.com/web/v1/user/auth/generate_cred_by_code"
-            cred_body = {"code": auth_code, "kind": 1}
-            async with session.post(
-                cred_url, headers=base_headers, json=cred_body
-            ) as resp:
-                cred_data = await resp.json(content_type=None)
+        cred_url = "https://zonai.skland.com/web/v1/user/auth/generate_cred_by_code"
+        cred_body = {"code": auth_code, "kind": 1}
+        async with session.post(cred_url, headers=base_headers, json=cred_body) as resp:
+            cred_data = await resp.json(content_type=None)
 
         if cred_data.get("code") != 0:
             logger.warning(f"Skland generate cred failed: {cred_data}")
@@ -133,15 +148,15 @@ class SklandClient:
             return False
         url = "https://zonai.skland.com/api/v1/auth/refresh"
         headers = {"cred": cred}
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as resp:
-                data = await resp.json(content_type=None)
-                if data.get("code") == 0:
-                    self.cred = cred
-                    self.access_token = data["data"]["token"]
-                    return True
-                logger.error(f"Failed to refresh token: {data}")
-                return False
+        session = await self._get_session()
+        async with session.get(url, headers=headers) as resp:
+            data = await resp.json(content_type=None)
+            if data.get("code") == 0:
+                self.cred = cred
+                self.access_token = data["data"]["token"]
+                return True
+            logger.error(f"Failed to refresh token: {data}")
+            return False
 
     async def refresh_token(self):
         """从用户 token 刷新签名凭证（并兼容直接 cred token 兜底）。"""
@@ -188,6 +203,30 @@ class SklandClient:
         )
         return sign, timestamp
 
+    async def _request_once(
+        self, path: str, query_clean: str, platform: str, use_md5: bool
+    ):
+        sign, timestamp = self._get_sign(
+            path, query_clean, platform=platform, use_md5=use_md5
+        )
+        headers = {
+            "cred": self.cred,
+            "sign": sign,
+            "source": "1",
+            "dId": self.dId,
+            "platform": platform,
+            "vName": "1.0.0",
+            "timestamp": timestamp,
+            "User-Agent": self._base_headers()["User-Agent"],
+            "X-Requested-With": "com.hypergryph.skland",
+        }
+        full_url = f"https://zonai.skland.com{path}"
+        if query_clean:
+            full_url = f"{full_url}?{query_clean}"
+        session = await self._get_session()
+        async with session.get(full_url, headers=headers) as resp:
+            return await resp.json(content_type=None)
+
     async def _request_json(
         self,
         path: str,
@@ -205,42 +244,27 @@ class SklandClient:
                 }
 
         query_clean = query[1:] if query.startswith("?") else query
-        sign, timestamp = self._get_sign(
-            path, query_clean, platform=self.platform, use_md5=True
-        )
-        headers = {
-            "cred": self.cred,
-            "sign": sign,
-            "source": "1",
-            "dId": self.dId,
-            "platform": self.platform,
-            "vName": "1.0.0",
-            "timestamp": timestamp,
-            "User-Agent": self._base_headers()["User-Agent"],
-            "X-Requested-With": "com.hypergryph.skland",
-        }
+        auth_retry_left = 1 if retry_on_auth else 0
+        sign_retry_left = 1 if retry_on_sign_error else 0
+        force_refresh_done = False
 
-        async with aiohttp.ClientSession() as session:
-            full_url = f"https://zonai.skland.com{path}"
-            if query_clean:
-                full_url = f"{full_url}?{query_clean}"
-            async with session.get(full_url, headers=headers) as resp:
-                data = await resp.json(content_type=None)
-
-        if retry_on_auth and self._is_auth_error(data):
-            logger.warning(
-                f"Skland auth failed, trying to refresh token and retry once: {data}"
+        while True:
+            data = await self._request_once(
+                path, query_clean, platform=self.platform, use_md5=True
             )
-            ok = await self.refresh_token()
-            if ok:
-                return await self._request_json(
-                    path,
-                    query,
-                    retry_on_auth=False,
-                    retry_on_sign_error=retry_on_sign_error,
-                )
 
-        if retry_on_sign_error and data.get("code") == 10000:
+            if auth_retry_left > 0 and self._is_auth_error(data):
+                auth_retry_left -= 1
+                logger.warning(
+                    f"Skland auth failed, trying to refresh token and retry once: {data}"
+                )
+                if await self.refresh_token():
+                    continue
+
+            if not (sign_retry_left > 0 and data.get("code") == 10000):
+                return data
+
+            sign_retry_left -= 1
             # 10000 常见于不同环境下签名或 platform 组合不匹配。
             # 在放弃前尝试多种已验证可用的组合。
             logger.warning(
@@ -248,22 +272,6 @@ class SklandClient:
                 self.platform,
             )
             fallback_platform = "3" if self.platform == "1" else "1"
-            full_url = f"https://zonai.skland.com{path}"
-            if query_clean:
-                full_url = f"{full_url}?{query_clean}"
-
-            async def _try_variant(platform: str, use_md5: bool):
-                sign_n, ts_n = self._get_sign(
-                    path, query_clean, platform=platform, use_md5=use_md5
-                )
-                headers_n = dict(headers)
-                headers_n["sign"] = sign_n
-                headers_n["timestamp"] = ts_n
-                headers_n["platform"] = platform
-
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(full_url, headers=headers_n) as resp:
-                        return await resp.json(content_type=None)
 
             # 放弃前尝试所有已知可用的签名/platform 组合。
             variants = [
@@ -272,19 +280,20 @@ class SklandClient:
                 (fallback_platform, False),
             ]
             for platform, use_md5 in variants:
-                data2 = await _try_variant(platform=platform, use_md5=use_md5)
+                data2 = await self._request_once(
+                    path, query_clean, platform=platform, use_md5=use_md5
+                )
                 if data2.get("code") == 0:
                     self.platform = platform
                     return data2
                 data = data2
 
             # 若签名仍失败，强制刷新一次凭证并在无签名递归场景下重试。
-            if await self.refresh_token():
-                return await self._request_json(
-                    path, query, retry_on_auth=False, retry_on_sign_error=False
-                )
+            if not force_refresh_done and await self.refresh_token():
+                force_refresh_done = True
+                continue
 
-        return data
+            return data
 
     async def get_binding(self):
         path = "/api/v1/game/player/binding"
