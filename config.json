@@ -1,0 +1,8 @@
+{
+    "token": "",
+    "check_interval": 60,
+    "notify_users": [
+        
+    ],
+    "preferred_uid": ""
+}
