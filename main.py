@@ -1,6 +1,7 @@
 import asyncio
 import json
 import secrets
+from collections.abc import Mapping
 from pathlib import Path
 
 from astrbot.api import logger
@@ -53,6 +54,7 @@ class ArknightsHelper(Star):
         self.skland = SklandClient(self.config.get("token", ""), self.device_id)
         self.check_task = None
         self._config_lock = asyncio.Lock()
+        self._init_lock = asyncio.Lock()
         self.reminded = bool(self.config.get("reminded_full", False))
 
     def _ensure_device_id(self) -> str:
@@ -73,9 +75,10 @@ class ArknightsHelper(Star):
             self._persist_config_unlocked()
 
     async def initialize(self):
-        if self.check_task and not self.check_task.done():
-            return
-        self.check_task = asyncio.create_task(self.check_sanity_loop())
+        async with self._init_lock:
+            if self.check_task and not self.check_task.done():
+                return
+            self.check_task = asyncio.create_task(self.check_sanity_loop())
 
     async def reload_config(self):
         async with self._config_lock:
@@ -103,26 +106,75 @@ class ArknightsHelper(Star):
             return "off"
         return None
 
+    @staticmethod
+    def _extract_platform_id(platform) -> str | None:
+        if platform is None:
+            return None
+
+        if isinstance(platform, str):
+            candidate = platform.strip()
+            return candidate or None
+
+        if isinstance(platform, Mapping):
+            for key in ("id", "platform_id"):
+                candidate = platform.get(key)
+                if candidate is not None:
+                    candidate = str(candidate).strip()
+                    if candidate:
+                        return candidate
+
+        direct_id = getattr(platform, "id", None)
+        if direct_id is not None:
+            candidate = str(direct_id).strip()
+            if candidate:
+                return candidate
+
+        meta = getattr(platform, "meta", None)
+        if not callable(meta):
+            return None
+        try:
+            meta_val = meta()
+        except Exception:
+            return None
+
+        if isinstance(meta_val, Mapping):
+            for key in ("id", "platform_id"):
+                candidate = meta_val.get(key)
+                if candidate is not None:
+                    candidate = str(candidate).strip()
+                    if candidate:
+                        return candidate
+            return None
+
+        candidate = getattr(meta_val, "id", None)
+        if candidate is None:
+            return None
+        candidate = str(candidate).strip()
+        return candidate or None
+
     def _known_platform_ids(self) -> set[str]:
         ids: set[str] = set()
-        platform_insts = getattr(self.context.platform_manager, "platform_insts", None)
+        platform_manager = getattr(self.context, "platform_manager", None)
+        platform_insts = getattr(platform_manager, "platform_insts", None)
         if platform_insts is None:
             return ids
 
-        if isinstance(platform_insts, dict):
-            iterable = platform_insts.values()
+        candidates = []
+        if isinstance(platform_insts, Mapping):
+            candidates.extend(platform_insts.keys())
+            candidates.extend(platform_insts.values())
+        elif isinstance(platform_insts, (str, bytes)):
+            candidates.append(platform_insts)
         else:
-            iterable = platform_insts
-
-        for platform in iterable:
             try:
-                meta = getattr(platform, "meta", None)
-                if callable(meta):
-                    platform_id = getattr(meta(), "id", None)
-                    if platform_id is not None:
-                        ids.add(str(platform_id))
-            except Exception:
-                continue
+                candidates.extend(platform_insts)
+            except TypeError:
+                candidates.append(platform_insts)
+
+        for platform in candidates:
+            platform_id = self._extract_platform_id(platform)
+            if platform_id:
+                ids.add(platform_id)
         return ids
 
     def _prune_invalid_notify_users(self, notify_users: list[str]) -> list[str]:

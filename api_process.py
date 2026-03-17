@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import secrets
 import time
 from urllib.parse import urlencode
 
@@ -21,7 +22,7 @@ class SklandClient:
         self.channel_master_id = "1"
         self.nickname = ""
         self.channel_name = ""
-        self.dId = str(d_id or "de9759a5afaa634f").strip()
+        self.dId = self._normalize_device_id(d_id)
         self.platform = "1"
         self._session: aiohttp.ClientSession | None = None
         self._session_lock = asyncio.Lock()
@@ -32,6 +33,13 @@ class SklandClient:
             sock_connect=5,
             sock_read=15,
         )
+
+    @staticmethod
+    def _normalize_device_id(d_id: str) -> str:
+        normalized = str(d_id or "").strip()
+        if normalized:
+            return normalized
+        return secrets.token_hex(8)
 
     @staticmethod
     def _normalize_token(token: str) -> str:
@@ -192,18 +200,23 @@ class SklandClient:
         session = await self._get_session()
         async with session.get(url, headers=headers) as resp:
             data = await self._read_json_response(resp, "Skland refresh")
-            if data.get("code") == 0:
+            code = data.get("code")
+            if str(code) == "0":
                 payload = data.get("data")
-                token = payload.get("token") if isinstance(payload, dict) else None
+                if not isinstance(payload, dict):
+                    logger.error("Skland refresh returned invalid data payload: %r", payload)
+                    return False
+                token = payload.get("token")
+                token = str(token).strip() if token is not None else ""
                 if not token:
-                    logger.error("Skland refresh missing token field")
+                    logger.error("Skland refresh missing token field in payload: %r", payload)
                     return False
                 self.cred = cred
-                self.access_token = str(token)
+                self.access_token = token
                 return True
             logger.error(
                 "Failed to refresh token: code=%s message=%s",
-                data.get("code"),
+                code,
                 data.get("message"),
             )
             return False

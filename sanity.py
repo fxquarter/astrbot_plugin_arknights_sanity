@@ -58,6 +58,8 @@ def extract_status(data: dict):
         return None
 
     ap_info = status_info.get("ap", {})
+    if not isinstance(ap_info, dict):
+        return None
     ap = ap_info.get("current")
     max_ap = ap_info.get("max")
     if ap is None or max_ap is None:
