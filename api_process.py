@@ -12,7 +12,7 @@ from astrbot.api import logger
 class SklandClient:
     """Skland API 客户端，包含换票、签名与重试兜底逻辑。"""
 
-    def __init__(self, token: str):
+    def __init__(self, token: str, d_id: str = ""):
         self.token = self._normalize_token(token)
         self.cred = ""
         self.access_token = ""
@@ -21,7 +21,7 @@ class SklandClient:
         self.channel_master_id = "1"
         self.nickname = ""
         self.channel_name = ""
-        self.dId = "de9759a5afaa634f"
+        self.dId = str(d_id or "de9759a5afaa634f").strip()
         self.platform = "1"
         self._session: aiohttp.ClientSession | None = None
         self._session_lock = asyncio.Lock()
@@ -93,7 +93,6 @@ class SklandClient:
                 "Safari/537.36; SKLand/1.52.1"
             ),
             "Accept-Encoding": "gzip",
-            "Connection": "close",
             "X-Requested-With": "com.hypergryph.skland",
             "dId": self.dId,
         }
@@ -194,8 +193,13 @@ class SklandClient:
         async with session.get(url, headers=headers) as resp:
             data = await self._read_json_response(resp, "Skland refresh")
             if data.get("code") == 0:
+                payload = data.get("data")
+                token = payload.get("token") if isinstance(payload, dict) else None
+                if not token:
+                    logger.error("Skland refresh missing token field")
+                    return False
                 self.cred = cred
-                self.access_token = data["data"]["token"]
+                self.access_token = str(token)
                 return True
             logger.error(
                 "Failed to refresh token: code=%s message=%s",

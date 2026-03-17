@@ -25,7 +25,7 @@ def estimate_realtime_ap(
     if current_ap >= max_ap:
         return current_ap, 0
 
-    now = now_ts or int(time.time())
+    now = now_ts if now_ts is not None else int(time.time())
 
     full_ts = to_int(
         ap_info.get("recoverTime")
@@ -66,6 +66,8 @@ def extract_status(data: dict):
     ap_val = to_int(ap)
     max_ap_val = to_int(max_ap)
     if ap_val is None or max_ap_val is None:
+        return None
+    if max_ap_val <= 0 or ap_val < 0:
         return None
     current_ts = to_seconds_ts(payload.get("currentTs"))
     ap_estimated, ap_full_eta = estimate_realtime_ap(

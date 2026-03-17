@@ -1,5 +1,6 @@
 import asyncio
 import json
+import secrets
 from pathlib import Path
 
 from astrbot.api import logger
@@ -48,17 +49,38 @@ class ArknightsHelper(Star):
             StarTools.get_data_dir("astrbot_plugin_arknights_sanity") / "config.json"
         )
         self.config = load_config(self.config_path)
-        self.skland = SklandClient(self.config.get("token", ""))
+        self.device_id = self._ensure_device_id()
+        self.skland = SklandClient(self.config.get("token", ""), self.device_id)
         self.check_task = None
         self._config_lock = asyncio.Lock()
-        self.reminded = False
+        self.reminded = bool(self.config.get("reminded_full", False))
+
+    def _ensure_device_id(self) -> str:
+        d_id = str(self.config.get("device_id", "")).strip()
+        if d_id:
+            return d_id
+
+        # 首次生成并持久化，避免多实例共享固定设备指纹。
+        d_id = secrets.token_hex(8)
+        self.config["device_id"] = d_id
+        save_config(self.config_path, self.config)
+        return d_id
+
+    async def _set_reminded_state(self, value: bool):
+        async with self._config_lock:
+            self.reminded = bool(value)
+            self.config["reminded_full"] = self.reminded
+            self._persist_config_unlocked()
 
     async def initialize(self):
+        if self.check_task and not self.check_task.done():
+            return
         self.check_task = asyncio.create_task(self.check_sanity_loop())
 
     async def reload_config(self):
         async with self._config_lock:
             self.config = load_config(self.config_path)
+            self.reminded = bool(self.config.get("reminded_full", self.reminded))
 
     def _persist_config_unlocked(self):
         save_config(self.config_path, self.config)
@@ -83,8 +105,24 @@ class ArknightsHelper(Star):
 
     def _known_platform_ids(self) -> set[str]:
         ids: set[str] = set()
-        for platform in self.context.platform_manager.platform_insts:
-            ids.add(str(platform.meta().id))
+        platform_insts = getattr(self.context.platform_manager, "platform_insts", None)
+        if platform_insts is None:
+            return ids
+
+        if isinstance(platform_insts, dict):
+            iterable = platform_insts.values()
+        else:
+            iterable = platform_insts
+
+        for platform in iterable:
+            try:
+                meta = getattr(platform, "meta", None)
+                if callable(meta):
+                    platform_id = getattr(meta(), "id", None)
+                    if platform_id is not None:
+                        ids.add(str(platform_id))
+            except Exception:
+                continue
         return ids
 
     def _prune_invalid_notify_users(self, notify_users: list[str]) -> list[str]:
@@ -94,6 +132,8 @@ class ArknightsHelper(Star):
             return []
 
         platform_ids = self._known_platform_ids()
+        if not platform_ids:
+            return notify_users
         valid: list[str] = []
         removed: list[str] = []
         for umo in notify_users:
@@ -274,13 +314,13 @@ class ArknightsHelper(Star):
                             )
                             # 仅当至少一个目标发送成功时才置 reminded。
                             # 若本轮全部失败，后续轮询会继续重试。
-                            self.reminded = sent > 0
+                            await self._set_reminded_state(sent > 0)
                             if sent == 0 and failed > 0:
                                 logger.warning(
                                     "full sanity reminder not delivered to any target, will retry next cycle"
                                 )
                         elif reminder_state["should_reset"]:
-                            self.reminded = False
+                            await self._set_reminded_state(False)
                     else:
                         logger.warning(
                             "check_sanity_loop skipped reminder due to API error: code=%s message=%s",
