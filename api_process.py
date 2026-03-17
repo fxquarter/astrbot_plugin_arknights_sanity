@@ -25,6 +25,13 @@ class SklandClient:
         self.platform = "1"
         self._session: aiohttp.ClientSession | None = None
         self._session_lock = asyncio.Lock()
+        self._request_lock = asyncio.Lock()
+        self._timeout = aiohttp.ClientTimeout(
+            total=20,
+            connect=5,
+            sock_connect=5,
+            sock_read=15,
+        )
 
     @staticmethod
     def _normalize_token(token: str) -> str:
@@ -98,12 +105,38 @@ class SklandClient:
         async with self._session_lock:
             if self._session and not self._session.closed:
                 return self._session
-            self._session = aiohttp.ClientSession()
+            self._session = aiohttp.ClientSession(timeout=self._timeout)
             return self._session
 
     async def close(self):
         if self._session and not self._session.closed:
             await self._session.close()
+
+    async def _read_json_response(
+        self, resp: aiohttp.ClientResponse, api_name: str
+    ) -> dict:
+        text = await resp.text()
+        if resp.status < 200 or resp.status >= 300:
+            logger.warning(
+                "%s http status=%s body=%s",
+                api_name,
+                resp.status,
+                text[:200],
+            )
+            return {
+                "code": -resp.status,
+                "message": f"{api_name} http status {resp.status}",
+            }
+
+        try:
+            data = json.loads(text) if text else {}
+        except json.JSONDecodeError:
+            logger.warning("%s returned non-json body=%s", api_name, text[:200])
+            return {"code": -3, "message": f"{api_name} 返回非 JSON 响应"}
+
+        if isinstance(data, dict):
+            return data
+        return {"code": -4, "message": f"{api_name} 返回数据结构异常"}
 
     async def _exchange_user_token_to_cred(self) -> bool:
         user_token = self._normalize_token(self.token)
@@ -117,24 +150,33 @@ class SklandClient:
         async with session.post(
             grant_url, headers=base_headers, json=grant_body
         ) as resp:
-            grant_data = await resp.json(content_type=None)
+            grant_data = await self._read_json_response(resp, "Skland grant")
 
         if grant_data.get("status") != 0:
-            logger.warning(f"Skland grant failed: {grant_data}")
+            logger.warning(
+                "Skland grant failed: status=%s code=%s message=%s",
+                grant_data.get("status"),
+                grant_data.get("code"),
+                grant_data.get("message"),
+            )
             return False
 
         auth_code = grant_data.get("data", {}).get("code")
         if not auth_code:
-            logger.warning(f"Skland grant returned empty code: {grant_data}")
+            logger.warning("Skland grant returned empty code")
             return False
 
         cred_url = "https://zonai.skland.com/web/v1/user/auth/generate_cred_by_code"
         cred_body = {"code": auth_code, "kind": 1}
         async with session.post(cred_url, headers=base_headers, json=cred_body) as resp:
-            cred_data = await resp.json(content_type=None)
+            cred_data = await self._read_json_response(resp, "Skland generate cred")
 
         if cred_data.get("code") != 0:
-            logger.warning(f"Skland generate cred failed: {cred_data}")
+            logger.warning(
+                "Skland generate cred failed: code=%s message=%s",
+                cred_data.get("code"),
+                cred_data.get("message"),
+            )
             return False
 
         payload = cred_data.get("data", {})
@@ -150,12 +192,16 @@ class SklandClient:
         headers = {"cred": cred}
         session = await self._get_session()
         async with session.get(url, headers=headers) as resp:
-            data = await resp.json(content_type=None)
+            data = await self._read_json_response(resp, "Skland refresh")
             if data.get("code") == 0:
                 self.cred = cred
                 self.access_token = data["data"]["token"]
                 return True
-            logger.error(f"Failed to refresh token: {data}")
+            logger.error(
+                "Failed to refresh token: code=%s message=%s",
+                data.get("code"),
+                data.get("message"),
+            )
             return False
 
     async def refresh_token(self):
@@ -225,7 +271,7 @@ class SklandClient:
             full_url = f"{full_url}?{query_clean}"
         session = await self._get_session()
         async with session.get(full_url, headers=headers) as resp:
-            return await resp.json(content_type=None)
+            return await self._read_json_response(resp, "Skland request")
 
     async def _request_json(
         self,
@@ -235,65 +281,68 @@ class SklandClient:
         retry_on_sign_error: bool = True,
     ):
         """发送签名请求，并在鉴权失败或签名异常时执行兜底重试。"""
-        if not self.access_token or not self.cred:
-            ok = await self.refresh_token()
-            if not ok:
-                return {
-                    "code": -1,
-                    "message": "token 刷新失败，请检查 config.json 中的 token 是否有效",
-                }
+        async with self._request_lock:
+            if not self.access_token or not self.cred:
+                ok = await self.refresh_token()
+                if not ok:
+                    return {
+                        "code": -1,
+                        "message": "token 刷新失败，请检查 config.json 中的 token 是否有效",
+                    }
 
-        query_clean = query[1:] if query.startswith("?") else query
-        auth_retry_left = 1 if retry_on_auth else 0
-        sign_retry_left = 1 if retry_on_sign_error else 0
-        force_refresh_done = False
+            query_clean = query[1:] if query.startswith("?") else query
+            auth_retry_left = 1 if retry_on_auth else 0
+            sign_retry_left = 1 if retry_on_sign_error else 0
+            force_refresh_done = False
 
-        while True:
-            data = await self._request_once(
-                path, query_clean, platform=self.platform, use_md5=True
-            )
-
-            if auth_retry_left > 0 and self._is_auth_error(data):
-                auth_retry_left -= 1
-                logger.warning(
-                    f"Skland auth failed, trying to refresh token and retry once: {data}"
+            while True:
+                data = await self._request_once(
+                    path, query_clean, platform=self.platform, use_md5=True
                 )
-                if await self.refresh_token():
+
+                if auth_retry_left > 0 and self._is_auth_error(data):
+                    auth_retry_left -= 1
+                    logger.warning(
+                        "Skland auth failed, trying to refresh token and retry once: code=%s message=%s",
+                        data.get("code"),
+                        data.get("message"),
+                    )
+                    if await self.refresh_token():
+                        continue
+
+                if not (sign_retry_left > 0 and data.get("code") == 10000):
+                    return data
+
+                sign_retry_left -= 1
+                # 10000 常见于不同环境下签名或 platform 组合不匹配。
+                # 在放弃前尝试多种已验证可用的组合。
+                logger.warning(
+                    "Skland request code=10000 on platform=%s, retrying with fallback platform/sign",
+                    self.platform,
+                )
+                fallback_platform = "3" if self.platform == "1" else "1"
+
+                # 放弃前尝试所有已知可用的签名/platform 组合。
+                variants = [
+                    (fallback_platform, True),
+                    (self.platform, False),
+                    (fallback_platform, False),
+                ]
+                for platform, use_md5 in variants:
+                    data2 = await self._request_once(
+                        path, query_clean, platform=platform, use_md5=use_md5
+                    )
+                    if data2.get("code") == 0:
+                        self.platform = platform
+                        return data2
+                    data = data2
+
+                # 若签名仍失败，强制刷新一次凭证并在无签名递归场景下重试。
+                if not force_refresh_done and await self.refresh_token():
+                    force_refresh_done = True
                     continue
 
-            if not (sign_retry_left > 0 and data.get("code") == 10000):
                 return data
-
-            sign_retry_left -= 1
-            # 10000 常见于不同环境下签名或 platform 组合不匹配。
-            # 在放弃前尝试多种已验证可用的组合。
-            logger.warning(
-                "Skland request code=10000 on platform=%s, retrying with fallback platform/sign",
-                self.platform,
-            )
-            fallback_platform = "3" if self.platform == "1" else "1"
-
-            # 放弃前尝试所有已知可用的签名/platform 组合。
-            variants = [
-                (fallback_platform, True),
-                (self.platform, False),
-                (fallback_platform, False),
-            ]
-            for platform, use_md5 in variants:
-                data2 = await self._request_once(
-                    path, query_clean, platform=platform, use_md5=use_md5
-                )
-                if data2.get("code") == 0:
-                    self.platform = platform
-                    return data2
-                data = data2
-
-            # 若签名仍失败，强制刷新一次凭证并在无签名递归场景下重试。
-            if not force_refresh_done and await self.refresh_token():
-                force_refresh_done = True
-                continue
-
-            return data
 
     async def get_binding(self):
         path = "/api/v1/game/player/binding"

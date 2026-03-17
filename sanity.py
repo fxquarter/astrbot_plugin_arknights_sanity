@@ -4,7 +4,7 @@ import time
 def to_int(value):
     try:
         return int(value)
-    except Exception:
+    except (TypeError, ValueError):
         return None
 
 
@@ -32,6 +32,7 @@ def estimate_realtime_ap(
         or ap_info.get("completeRecoveryTime")
         or ap_info.get("fullRecoveryTime")
     )
+    full_ts = to_seconds_ts(full_ts)
     if full_ts:
         remain = max(0, full_ts - now)
         missing = (remain + 359) // 360
@@ -39,6 +40,7 @@ def estimate_realtime_ap(
         return max(current_ap, min(max_ap, estimated)), remain
 
     last_add_ts = to_int(ap_info.get("lastApAddTime") or ap_info.get("lastRecoverTime"))
+    last_add_ts = to_seconds_ts(last_add_ts)
     if last_add_ts:
         gained = max(0, (now - last_add_ts) // 360)
         estimated = min(max_ap, current_ap + gained)

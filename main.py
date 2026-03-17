@@ -4,7 +4,7 @@ from pathlib import Path
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star, StarTools, register
 
 from .api_process import SklandClient
 from .sanity import evaluate_reminder_state, extract_status
@@ -44,7 +44,9 @@ def save_config(config_path: Path, config: dict) -> None:
 class ArknightsHelper(Star):
     def __init__(self, context: Context):
         super().__init__(context)
-        self.config_path = Path(__file__).with_name("config.json")
+        self.config_path = (
+            StarTools.get_data_dir("astrbot_plugin_arknights_sanity") / "config.json"
+        )
         self.config = load_config(self.config_path)
         self.skland = SklandClient(self.config.get("token", ""))
         self.check_task = None
@@ -54,12 +56,30 @@ class ArknightsHelper(Star):
     async def initialize(self):
         self.check_task = asyncio.create_task(self.check_sanity_loop())
 
-    def reload_config(self):
-        self.config = load_config(self.config_path)
-
-    async def persist_config(self):
+    async def reload_config(self):
         async with self._config_lock:
-            save_config(self.config_path, self.config)
+            self.config = load_config(self.config_path)
+
+    def _persist_config_unlocked(self):
+        save_config(self.config_path, self.config)
+
+    @staticmethod
+    def _normalize_check_interval(raw_value) -> int:
+        try:
+            interval = int(raw_value)
+        except (TypeError, ValueError):
+            return 600
+        # 防止异常配置导致 0/负数空转轮询。
+        return max(30, interval)
+
+    @staticmethod
+    def _parse_notify_action(msg: str) -> str | None:
+        normalized = " ".join(str(msg or "").strip().lower().split())
+        if normalized in {"notify on", "ark notify on", "/ark notify on"}:
+            return "on"
+        if normalized in {"notify off", "ark notify off", "/ark notify off"}:
+            return "off"
+        return None
 
     def _known_platform_ids(self) -> set[str]:
         ids: set[str] = set()
@@ -67,13 +87,9 @@ class ArknightsHelper(Star):
             ids.add(str(platform.meta().id))
         return ids
 
-    async def _prune_invalid_notify_users(self) -> list[str]:
+    def _prune_invalid_notify_users(self, notify_users: list[str]) -> list[str]:
         """清理平台适配器已不存在的会话。"""
-        notify_users = [
-            str(umo).strip()
-            for umo in self.config.get("notify_users", [])
-            if str(umo).strip()
-        ]
+        notify_users[:] = [str(umo).strip() for umo in notify_users if str(umo).strip()]
         if not notify_users:
             return []
 
@@ -89,16 +105,20 @@ class ArknightsHelper(Star):
 
         if removed:
             logger.warning("removed stale notify sessions: %s", ",".join(removed))
-            self.config["notify_users"] = valid
-            await self.persist_config()
+            # 原地修改列表，避免外部持有旧引用导致写入丢失。
+            notify_users[:] = valid
 
-        return valid
+        return notify_users
 
     async def _send_full_sanity_reminder(self, ap: int, max_ap: int) -> tuple[int, int]:
         """主动推送满理智提醒，并返回 (成功数, 失败数)。"""
         from astrbot.api.event import MessageChain
 
-        notify_users = await self._prune_invalid_notify_users()
+        async with self._config_lock:
+            self.config = load_config(self.config_path)
+            notify_users = self.config.setdefault("notify_users", [])
+            notify_users = self._prune_invalid_notify_users(notify_users)
+            self._persist_config_unlocked()
         if not notify_users:
             return 0, 0
 
@@ -139,30 +159,36 @@ class ArknightsHelper(Star):
     @filter.command("ark")
     async def ark_command(self, event: AstrMessageEvent):
         """明日方舟助手指令：/ark notify on/off"""
-        self.reload_config()
         umo = event.unified_msg_origin
-        msg = event.message_str.strip()
-        notify_users = self.config.setdefault("notify_users", [])
-
-        if "notify on" in msg:
-            await self._prune_invalid_notify_users()
-            if umo not in notify_users:
-                notify_users.append(umo)
-                await self.persist_config()
-            yield event.plain_result("满理智提醒已开启！理智达到最大值时将提醒您。")
-        elif "notify off" in msg:
-            if umo in notify_users:
-                notify_users.remove(umo)
-                await self.persist_config()
-            yield event.plain_result("满理智提醒已关闭！")
-        else:
+        action = self._parse_notify_action(event.message_str)
+        if not action:
             yield event.plain_result(
                 "未知指令。请使用 /ark notify on 或 /ark notify off"
             )
+            return
+
+        async with self._config_lock:
+            self.config = load_config(self.config_path)
+            notify_users = self.config.setdefault("notify_users", [])
+            notify_users = self._prune_invalid_notify_users(notify_users)
+
+            if action == "on":
+                if umo not in notify_users:
+                    notify_users.append(umo)
+                self._persist_config_unlocked()
+            else:
+                if umo in notify_users:
+                    notify_users.remove(umo)
+                self._persist_config_unlocked()
+
+        if action == "on":
+            yield event.plain_result("满理智提醒已开启！理智达到最大值时将提醒您。")
+        else:
+            yield event.plain_result("满理智提醒已关闭！")
 
     @filter.command("理智")
     async def check_sanity(self, event: AstrMessageEvent):
-        self.reload_config()
+        await self.reload_config()
         if not self.config.get("token"):
             yield event.plain_result("未配置森空岛 token，请在 config.json 中配置。")
             return
@@ -218,7 +244,7 @@ class ArknightsHelper(Star):
         """轮询状态；当状态进入“满理智”时触发提醒。"""
         while True:
             try:
-                self.reload_config()
+                await self.reload_config()
                 if self.config.get("token") and self.config.get("notify_users"):
                     self.skland.set_cred_token(self.config.get("token", ""))
                     self.skland.set_preferred_uid(self.config.get("preferred_uid", ""))
@@ -231,7 +257,11 @@ class ArknightsHelper(Star):
                                 "Skland loop parse failed, invalid payload: %s",
                                 json.dumps(data, ensure_ascii=False)[:600],
                             )
-                            await asyncio.sleep(self.config.get("check_interval", 600))
+                            await asyncio.sleep(
+                                self._normalize_check_interval(
+                                    self.config.get("check_interval", 600)
+                                )
+                            )
                             continue
 
                         reminder_state = evaluate_reminder_state(status, self.reminded)
@@ -263,7 +293,9 @@ class ArknightsHelper(Star):
             except Exception as e:
                 logger.error(f"Error in check_sanity_loop: {e}")
 
-            await asyncio.sleep(self.config.get("check_interval", 600))
+            await asyncio.sleep(
+                self._normalize_check_interval(self.config.get("check_interval", 600))
+            )
 
     async def terminate(self):
         if self.check_task:
